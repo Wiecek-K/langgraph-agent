@@ -1,24 +1,17 @@
-// agent.ts
-
-// IMPORTANT - Add your API keys here. Be careful not to publish them.
 import { ChatOpenAI } from "@langchain/openai";
 
 process.env.OPENAI_API_KEY =
   "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";
 process.env.TAVILY_API_KEY = "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";
 process.env.GROQ_API_KEY =
-  "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";
+  "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";
 
 import { ChatGroq } from "@langchain/groq";
-import { TavilySearchResults } from "@langchain/community/tools/tavily_search";
 
-import { AIMessage, BaseMessage, HumanMessage } from "@langchain/core/messages";
-import { ToolNode } from "@langchain/langgraph/prebuilt";
 import { Annotation, END, START, StateGraph } from "@langchain/langgraph";
 import { tool } from "@langchain/core/tools";
 import { z } from "zod";
 import { PromptTemplate } from "@langchain/core/prompts";
-
 
 const acceptProfileTool = tool(
   async () => {
@@ -52,12 +45,17 @@ const rejectProfileTool = tool(
 const tools = [acceptProfileTool, rejectProfileTool];
 
 // Create a model and give it access to the tools
-const model = new ChatGroq({
+const evaluationModel = new ChatGroq({
   // model: "llama3-groq-8b-8192-tool-use-preview",
   model: "llama-3.1-70b-versatile",
   // model: "llama3-70b-8192",
   temperature: 0.1,
-})
+});
+
+const executionModel = new ChatGroq({
+  model: "llama3-groq-8b-8192-tool-use-preview",
+  temperature: 0.1,
+}).bindTools(tools);
 
 // const model = new ChatOpenAI({
 //   model: "gpt-4o-mini",
@@ -68,24 +66,23 @@ const model = new ChatGroq({
 // See here for more info: https://langchain-ai.github.io/langgraphjs/how-tos/define-state/
 const fetchProfile = (profileId: string) => ({
   name: "Jakub",
-  bio: "I am a cool dupa dupa dupa dupa dupa dupa"
-})
+  bio: "Jestem doświadczonym programistą specializującym się w budowaniu aplikacji internetowych przy pomocy Reactjs",
+});
 
 const StateAnnotation = Annotation.Root({
   profileId: Annotation<string>(),
-  profile: Annotation<{ name: string, bio: string }>(),
+  profile: Annotation<{ name: string; bio: string }>(),
+  evaluation: Annotation<string>(),
 });
 
 // Define the function that calls the model
 async function retrieveProfile(state: typeof StateAnnotation.State) {
-
   const fetchedProfile = fetchProfile(state.profileId);
 
-  return { profile: fetchedProfile};
+  return { profile: fetchedProfile };
 }
 
 async function evaluateProfile(state: typeof StateAnnotation.State) {
-
   const profile = state.profile;
 
   const prompt = PromptTemplate.fromTemplate(`
@@ -105,17 +102,62 @@ async function evaluateProfile(state: typeof StateAnnotation.State) {
   '''
   
   Profile details:
-  {profile}
+  {name}
+  {bio}
   
-  `)
+  `);
 
-  const evaluator = prompt.pipe(model.bindTools(tools))
+  // const evaluator = prompt.pipe(model.bindTools(tools));
 
-  const decision = await evaluator.invoke({
-    profile
-  })
+  const evaluator = prompt.pipe(evaluationModel);
 
-  console.log('decision', decision)
+  const result = await evaluator.invoke({
+    name: profile.name,
+    bio: profile.bio,
+  });
+
+  return { ...state, evaluation: result.content };
+}
+
+async function executeDecision(state: typeof StateAnnotation.State) {
+  const evaluation = state.evaluation;
+
+  const prompt = PromptTemplate.fromTemplate(`
+  Based on the following evaluation of a candidate's profile, execute the appropriate action using the provided tools.
+
+  Evaluation:
+  {evaluation}
+
+  If the decision is to accept the profile, use the accept_profile tool.
+  If the decision is to reject the profile, use the reject_profile tool and provide the reason for rejection.
+
+  Use the appropriate tool.
+  `);
+
+  // const executor = prompt.pipe(executionModel.bindTools(tools));
+  const executor = prompt.pipe(executionModel);
+
+  const result = await executor.invoke({
+    evaluation: evaluation,
+  });
+
+  // console.log("Execution result:", result);
+
+  let toolResult;
+  if (result.tool_calls) {
+    if (result.tool_calls[0].name === "accept_profile") {
+      toolResult = await acceptProfileTool.invoke({});
+    } else if (result.tool_calls[0].name === "reject_profile") {
+      toolResult = await rejectProfileTool.invoke({
+        reason: result.tool_calls[0].args.reason,
+      });
+    } else {
+      throw new Error(`Invalid tool specified: ${result.tool_calls[0].name}`);
+    }
+  } else {
+    throw new Error(`Tool not specified`);
+  }
+
 
   return { ...state };
 }
@@ -124,21 +166,25 @@ async function evaluateProfile(state: typeof StateAnnotation.State) {
 const workflow = new StateGraph(StateAnnotation)
   .addNode("retrieveProfile", retrieveProfile)
   .addNode("evaluateProfile", evaluateProfile)
+  .addNode("executeDecision", executeDecision)
   .addEdge(START, "retrieveProfile")
   .addEdge("retrieveProfile", "evaluateProfile")
-  .addEdge("evaluateProfile", END)
+  .addEdge("evaluateProfile", "executeDecision")
+  .addEdge("executeDecision", END);
 
 // Finally, we compile it into a LangChain Runnable.
 const app = workflow.compile();
 
-
 // Use the agent
 
-const evaluateProfileWorkflow = async (profileId: string) => await app.invoke({
-  profileId
-});
+const evaluateProfileWorkflow = async (profileId: string) =>
+  await app.invoke({
+    profileId,
+  });
 
 const finalState = await evaluateProfileWorkflow("user_12378ajhs");
+
+// console.log(finalState);
 
 // console.log(finalState.messages[finalState.messages.length - 1].content);
 
